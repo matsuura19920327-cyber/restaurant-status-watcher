@@ -1,0 +1,22 @@
+{
+  "name": "restaurant-status-watcher",
+  "version": "1.0.0",
+  "description": "食べログ店舗の掲載保留ステータスを毎日チェックするバッチシステム",
+  "scripts": {
+    "build": "tsc",
+    "setup": "ts-node src/setup.ts",
+    "check": "ts-node src/index.ts",
+    "test:status": "ts-node src/testStatus.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.0",
+    "googleapis": "^140.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  }
+}

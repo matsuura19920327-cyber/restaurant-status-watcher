@@ -1,0 +1,36 @@
+name: Daily Restaurant Status Check
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # 毎日 UTC 23:00 = JST 08:00
+  workflow_dispatch:       # 手動実行も可能
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run status check
+        env:
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REQUEST_INTERVAL_MS: ${{ vars.REQUEST_INTERVAL_MS || '3000' }}
+          BLOCKED_THRESHOLD: ${{ vars.BLOCKED_THRESHOLD || '5' }}
+          USER_AGENT: ${{ vars.USER_AGENT }}
+          TIMEZONE: Asia/Tokyo
+        run: npm run check
