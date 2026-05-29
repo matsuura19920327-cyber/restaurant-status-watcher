@@ -1,3 +1,5 @@
+import axios from 'axios';
+import * as cheerio from 'cheerio';
 import { chromium } from 'playwright';
 import { logger } from '../utils/logger';
 import { sleep } from '../utils/sleep';
@@ -11,13 +13,19 @@ export interface CollectedShop {
   genre: string;
 }
 
-// 食べログ店舗URLの判定: パス階層が /都道府県/A####/A######/数字/ の4階層のみ
+export interface CollectOptions {
+  areaName?: string;
+  genre?: string;
+  maxPages?: number;
+  pageIntervalMs?: number;
+}
+
+// 店舗URLの判定: /都道府県/A####/A######/数字/ の4階層のみ
 function isCleanShopUrl(href: string): boolean {
   try {
     const url = new URL(href);
     if (!url.hostname.includes('tabelog.com')) return false;
     const parts = url.pathname.split('/').filter(Boolean);
-    // ["tokyo", "A1304", "A130401", "13012345"] の4つだけが店舗ページ
     return (
       parts.length === 4 &&
       /^A\d+$/.test(parts[1]) &&
@@ -29,48 +37,134 @@ function isCleanShopUrl(href: string): boolean {
   }
 }
 
-// 次ページリンクのセレクタ候補（食べログのHTML構造変更に備えて複数用意）
-const NEXT_PAGE_SELECTORS = [
-  'a[data-anchor="next"]',
-  'a.c-pagination__next',
-  'a[rel="next"]',
-  '.c-pagination__arrow-next a',
-  'a.js-gtm-seo-pagination-next',
-];
+function extractShopsFromHtml(html: string): { href: string; name: string }[] {
+  const $ = cheerio.load(html);
+  const found: { href: string; name: string }[] = [];
 
-// 店舗名リンクのセレクタ候補（検索結果・ランキングページ）
-const SHOP_LINK_SELECTORS = [
-  'a.list-rst__rst-name-target',
-  'a.hyakumeiten-list__rst-name',
-  'a.award-rst__name',
-  '.list-rst h3 a',
-  '.ranking-list h3 a',
-];
+  // 専用セレクタ優先（検索結果・ランキング）
+  const selectors = [
+    'a.list-rst__rst-name-target',
+    'a.hyakumeiten-list__rst-name',
+    'a.award-rst__name',
+  ];
 
-export interface CollectOptions {
-  areaName?: string;
-  genre?: string;
-  maxPages?: number;
-  pageIntervalMs?: number;
+  for (const selector of selectors) {
+    $(selector).each((_, el) => {
+      const href = $(el).attr('href') ?? '';
+      const name = $(el).text().replace(/\s+/g, ' ').trim();
+      if (href) found.push({ href, name });
+    });
+    if (found.length > 0) return found;
+  }
+
+  // フォールバック: 全aタグからパターンマッチ
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') ?? '';
+    const name = $(el).text().replace(/\s+/g, ' ').trim();
+    if (href) found.push({ href, name });
+  });
+
+  return found;
 }
 
-export async function collectShopsFromUrl(
+function findNextPageUrl(html: string, baseUrl: string): string | null {
+  const $ = cheerio.load(html);
+  const selectors = [
+    'a[data-anchor="next"]',
+    'a.c-pagination__next',
+    'a[rel="next"]',
+    '.c-pagination__arrow-next a',
+  ];
+  for (const selector of selectors) {
+    const href = $(selector).attr('href');
+    if (href) {
+      try { return new URL(href, baseUrl).toString(); } catch { /* skip */ }
+    }
+  }
+  return null;
+}
+
+// --- axios による収集（軽量・高速） ---
+async function collectWithAxios(
   startUrl: string,
-  options: CollectOptions = {},
+  options: CollectOptions,
+): Promise<CollectedShop[] | null> {
+  const { areaName = '', genre = '', maxPages = 3, pageIntervalMs = 3000 } = options;
+  const results: CollectedShop[] = [];
+  const seenIds = new Set<string>();
+
+  let currentUrl: string | null = startUrl;
+  let pageNum = 1;
+
+  try {
+    while (currentUrl && pageNum <= maxPages) {
+      logger.info(`  [axios] ページ ${pageNum} 取得: ${currentUrl}`);
+
+      const response = await axios.get<string>(currentUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'ja-JP,ja;q=0.9',
+          'Referer': 'https://tabelog.com/',
+        },
+        timeout: 15000,
+        validateStatus: (s) => s < 500,
+      });
+
+      if (response.status === 403 || response.status === 429) {
+        logger.warn(`  [axios] アクセス制限 (HTTP ${response.status})。Playwrightにフォールバック`);
+        return null;
+      }
+
+      const links = extractShopsFromHtml(response.data);
+      let newOnPage = 0;
+
+      for (const { href, name } of links) {
+        if (!isCleanShopUrl(href)) continue;
+        let normalized: string;
+        try { normalized = normalizeUrl(href); } catch { continue; }
+        const shopId = extractShopId(normalized);
+        if (!shopId || seenIds.has(shopId)) continue;
+        seenIds.add(shopId);
+        results.push({ shopId, shopUrl: normalized, shopName: name, areaName, genre });
+        newOnPage++;
+      }
+
+      logger.info(`  [axios] → ${newOnPage} 件取得（累計 ${results.length} 件）`);
+
+      const nextUrl = findNextPageUrl(response.data, currentUrl);
+      currentUrl = nextUrl;
+      pageNum++;
+      if (currentUrl) await sleep(pageIntervalMs);
+    }
+  } catch (error) {
+    logger.warn(`  [axios] 取得失敗: ${error}。Playwrightにフォールバック`);
+    return null;
+  }
+
+  // 取得できたが0件の場合もフォールバック対象
+  if (results.length === 0) {
+    logger.warn('  [axios] 0件。Playwrightにフォールバック');
+    return null;
+  }
+
+  return results;
+}
+
+// --- Playwright による収集（フォールバック） ---
+async function collectWithPlaywright(
+  startUrl: string,
+  options: CollectOptions,
 ): Promise<CollectedShop[]> {
-  const {
-    areaName = '',
-    genre = '',
-    maxPages = 10,
-    pageIntervalMs = 3000,
-  } = options;
+  const { areaName = '', genre = '', maxPages = 3, pageIntervalMs = 3000 } = options;
+  const results: CollectedShop[] = [];
+  const seenIds = new Set<string>();
 
   const browser = await chromium.launch({
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
   });
-  const results: CollectedShop[] = [];
-  const seenIds = new Set<string>();
 
   try {
     const context = await browser.newContext({
@@ -80,129 +174,76 @@ export async function collectShopsFromUrl(
       timezoneId: 'Asia/Tokyo',
       viewport: { width: 1280, height: 800 },
       extraHTTPHeaders: {
-        'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ja-JP,ja;q=0.9',
       },
     });
-    // webdriver フラグを隠す
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
     });
-    const page = await context.newPage();
 
+    const page = await context.newPage();
     let currentUrl: string | null = startUrl;
     let pageNum = 1;
 
     while (currentUrl && pageNum <= maxPages) {
-      logger.info(`ページ ${pageNum}/${maxPages} を取得中: ${currentUrl}`);
+      logger.info(`  [playwright] ページ ${pageNum} 取得: ${currentUrl}`);
 
       try {
         await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        // 店舗リストが現れるまで待つ（最大8秒）
         await page.waitForSelector(
-          '.list-rst__rst-name-target, .hyakumeiten-list__rst-name, .js-rstinfo-panel, .list-rst',
+          '.list-rst__rst-name-target, .hyakumeiten-list__rst-name, .list-rst',
           { timeout: 8000 },
-        ).catch(() => {
-          // セレクタが見つからなくてもページの内容で続行
-        });
+        ).catch(() => {});
         await page.waitForTimeout(1000);
 
-        // CAPTCHA・ブロック検知
-        const title = await page.title();
-        if (title.toLowerCase().includes('access denied') || title.includes('ロボット')) {
-          logger.warn(`アクセス制限を検知しました (title: ${title})。収集を停止します。`);
-          break;
-        }
-
-        // 1. 専用セレクタで店舗リンクを抽出（店舗名も取れる）
-        let shopLinks: { href: string; name: string }[] = [];
-        for (const selector of SHOP_LINK_SELECTORS) {
-          const found = await page.$$eval(selector, (anchors) =>
-            (anchors as HTMLAnchorElement[]).map((a) => ({
-              href: a.href ?? '',
-              name: (a.textContent ?? '').replace(/\s+/g, ' ').trim(),
-            })),
-          );
-          if (found.length > 0) {
-            shopLinks = found;
-            break;
-          }
-        }
-
-        // 2. 専用セレクタで取れなければ全aタグからパターンマッチ
-        if (shopLinks.length === 0) {
-          shopLinks = await page.$$eval('a[href]', (anchors) =>
-            (anchors as HTMLAnchorElement[]).map((a) => ({
-              href: a.href ?? '',
-              name: (a.textContent ?? '').replace(/\s+/g, ' ').trim(),
-            })),
-          );
-        }
-
+        const html = await page.content();
+        const links = extractShopsFromHtml(html);
         let newOnPage = 0;
-        for (const { href, name } of shopLinks) {
+
+        for (const { href, name } of links) {
           if (!isCleanShopUrl(href)) continue;
-
-          let normalizedUrl: string;
-          try {
-            normalizedUrl = normalizeUrl(href);
-          } catch {
-            continue;
-          }
-
-          const shopId = extractShopId(normalizedUrl);
+          let normalized: string;
+          try { normalized = normalizeUrl(href); } catch { continue; }
+          const shopId = extractShopId(normalized);
           if (!shopId || seenIds.has(shopId)) continue;
-
           seenIds.add(shopId);
-          results.push({
-            shopId,
-            shopUrl: normalizedUrl,
-            shopName: name,
-            areaName,
-            genre,
-          });
+          results.push({ shopId, shopUrl: normalized, shopName: name, areaName, genre });
           newOnPage++;
         }
 
-        logger.info(`  → ${newOnPage} 件取得（累計 ${results.length} 件）`);
+        logger.info(`  [playwright] → ${newOnPage} 件取得（累計 ${results.length} 件）`);
 
-        // 次ページリンクを探す
-        let nextUrl: string | null = null;
-        for (const selector of NEXT_PAGE_SELECTORS) {
-          const href = await page.$eval(
-            selector,
-            (el) => (el as HTMLAnchorElement).href,
-          ).catch(() => null);
-          if (href) {
-            nextUrl = href;
-            break;
-          }
-        }
-
+        const nextUrl = findNextPageUrl(html, currentUrl);
         currentUrl = nextUrl;
         pageNum++;
-
-        if (currentUrl) {
-          await sleep(pageIntervalMs);
-        }
+        if (currentUrl) await sleep(pageIntervalMs);
       } catch (error) {
-        logger.error(`ページ ${pageNum} の取得に失敗: ${error}`);
+        logger.error(`  [playwright] ページ取得失敗: ${error}`);
         break;
       }
-    }
-
-    if (pageNum > maxPages) {
-      logger.info(`最大ページ数 (${maxPages}) に達しました。`);
     }
   } finally {
     await browser.close();
   }
 
   return results;
+}
+
+// --- メイン収集関数 ---
+export async function collectShopsFromUrl(
+  startUrl: string,
+  options: CollectOptions = {},
+): Promise<CollectedShop[]> {
+  // まず axios で試みる
+  const axiosResult = await collectWithAxios(startUrl, options);
+  if (axiosResult !== null) {
+    logger.info(`  収集完了 (axios): ${axiosResult.length} 件`);
+    return axiosResult;
+  }
+
+  // axios がダメなら Playwright にフォールバック
+  logger.info('  Playwright で再試行...');
+  const playwrightResult = await collectWithPlaywright(startUrl, options);
+  logger.info(`  収集完了 (playwright): ${playwrightResult.length} 件`);
+  return playwrightResult;
 }

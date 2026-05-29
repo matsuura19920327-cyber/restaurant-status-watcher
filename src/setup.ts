@@ -12,6 +12,10 @@ import { logger } from './utils/logger';
 
 const SHEETS_CONFIG = [
   {
+    name: 'search_targets',
+    headers: ['target_id', 'area_name', 'genre', 'search_url', 'max_pages', 'enabled'],
+  },
+  {
     name: 'shops',
     headers: [
       'shop_id', 'source', 'shop_name', 'shop_url', 'area_name', 'genre',
